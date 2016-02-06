@@ -565,6 +565,9 @@ static int match_modex(opal_btl_usnic_module_t *module,
      * and cache it in the proc.  Store per-proc instead of per-module, since
      * MPI dynamic process routines can add procs but not new modules. */
     if (NULL == proc->proc_ep_match_table) {
+    // JMS
+    usnic_time_add(0, -1);
+
         proc->proc_ep_match_table = malloc(num_modules *
                                        sizeof(*proc->proc_ep_match_table));
         if (NULL == proc->proc_ep_match_table) {
@@ -592,10 +595,16 @@ static int match_modex(opal_btl_usnic_module_t *module,
                                            opal_proc_local_get()->proc_name);
 #endif
 
+    // JMS
+    usnic_time_add(1, 0);
+
         err = create_proc_module_graph(proc, proc_is_left, &g);
         if (OPAL_SUCCESS != err) {
             goto out_free_table;
         }
+
+    // JMS
+    usnic_time_add(2, 1);
 
         int nme = 0;
         int *me = NULL;
@@ -605,16 +614,24 @@ static int match_modex(opal_btl_usnic_module_t *module,
             goto out_free_graph;
         }
 
+    // JMS
+    usnic_time_add(3,2);
+
         edge_pairs_to_match_table(proc, proc_is_left, nme, me);
         free(me);
+
+    // JMS
+        usnic_time_add(4,3);
 
         err = opal_btl_usnic_gr_free(g);
         if (OPAL_SUCCESS != err) {
             OPAL_ERROR_LOG(err);
             return err;
         }
-    }
 
+    // JMS
+        usnic_time_add(-1,4);
+    }
 
     if (!proc->proc_match_exists) {
         opal_output_verbose(5, USNIC_OUT, "btl:usnic:%s: unable to find any valid interface pairs for proc %s",
@@ -700,6 +717,9 @@ opal_btl_usnic_create_endpoint(opal_btl_usnic_module_t *module,
     assert(modex_index >= 0 && modex_index < (int)proc->proc_modex_count);
     endpoint->endpoint_remote_modex = proc->proc_modex[modex_index];
 
+    //JMS
+    usnic_time_add(7,6);
+
     /* Initialize endpoint sequence number info */
     endpoint->endpoint_next_seq_to_send = module->local_modex.isn;
     endpoint->endpoint_ack_seq_rcvd = endpoint->endpoint_next_seq_to_send - 1;
@@ -731,6 +751,8 @@ opal_btl_usnic_create_endpoint(opal_btl_usnic_module_t *module,
     endpoint->endpoint_on_all_endpoints = true;
     opal_mutex_unlock(&module->all_endpoints_lock);
 
+    // JMS
+    usnic_time_add(-1,7);
     *endpoint_o = endpoint;
     return OPAL_SUCCESS;
 }

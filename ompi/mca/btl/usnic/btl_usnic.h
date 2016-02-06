@@ -267,5 +267,78 @@ void opal_btl_usnic_component_debug(void);
  */
 void opal_btl_usnic_connectivity_map(void);
 
+
+
+
+
+// JMS
+#define USNIC_NUM_TIMERS 10
+extern uint64_t usnic_timers[2][USNIC_NUM_TIMERS];
+extern uint64_t usnic_timer_overall;
+
+static inline uint64_t usnic_timestamp(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    uint64_t ret;
+    ret = t.tv_sec * 1000000000 + t.tv_nsec;
+    return ret;
+}
+
+static inline void usnic_time_init(void)
+{
+    usnic_timer_overall = usnic_timestamp();
+
+    for (int i = 0; i < USNIC_NUM_TIMERS; ++i) {
+        usnic_timers[0][i] = usnic_timers[1][0] = 0;
+    }
+}
+
+static inline void usnic_time_finalize(void)
+{
+    usnic_timer_overall = (usnic_timestamp() - usnic_timer_overall);
+}
+
+static inline void usnic_time(int start, int stop)
+{
+    uint64_t tmp;
+
+    tmp = usnic_timestamp();
+    if (start >= 0) {
+        usnic_timers[0][start] = tmp;
+    }
+    if (stop >= 0) {
+        usnic_timers[0][stop] = (tmp - usnic_timers[0][stop]);
+    }
+}
+
+static inline void usnic_time_add(int start, int stop)
+{
+    uint64_t tmp;
+
+    tmp = usnic_timestamp();
+    if (start >= 0) {
+        usnic_timers[1][start] = tmp;
+    }
+    if (stop >= 0) {
+        usnic_timers[0][stop] += (tmp - usnic_timers[1][stop]);
+    }
+}
+
+static inline void usnic_time_dump(int first, int last, const char *string)
+{
+    return;
+
+
+    double p;
+    for (int i = first; i <= last; ++i) {
+        p = (double) usnic_timers[0][i];
+        p /= usnic_timer_overall;
+        p *= 100.0;
+        opal_output(0, "%s Timer[%d] = %" PRIu64 " (%.1lf%%)",
+                    string, i, usnic_timers[0][i], p);
+    }
+}
+
 END_C_DECLS
 #endif

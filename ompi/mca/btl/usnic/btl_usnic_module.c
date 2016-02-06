@@ -68,6 +68,10 @@ static void finalize_one_channel(opal_btl_usnic_module_t *module,
                                  struct opal_btl_usnic_channel_t *channel);
 
 
+// JMS
+uint64_t usnic_timers[2][USNIC_NUM_TIMERS] = {{0}};
+uint64_t usnic_timer_overall = 0;
+
 /*
  * Loop over the procs sent to us in add_procs and see if we want to
  * add a proc/endpoint for them.
@@ -183,8 +187,10 @@ static int usnic_add_procs(struct mca_btl_base_module_t* base_module,
     opal_btl_usnic_module_t* module = (opal_btl_usnic_module_t*) base_module;
     int rc;
 
-    /* Go create the endpoints (including all relevant address
-       resolution) */
+    // JMS
+    usnic_time_init();
+
+    /* Create all the endpoints */
     rc = add_procs_create_endpoints(module, nprocs, procs, endpoints);
     if (OPAL_SUCCESS != rc) {
         goto fail;
@@ -212,6 +218,13 @@ static int usnic_add_procs(struct mca_btl_base_module_t* base_module,
               mca_btl_usnic_component.num_modules)) {
         opal_btl_usnic_connectivity_map();
     }
+
+    // JMS
+    usnic_time_finalize();
+    char *msg;
+    asprintf(&msg, "add_procs %s", module->fabric_info->fabric_attr->name);
+    usnic_time_dump(0, 7, msg);
+    free(msg);
 
     return OPAL_SUCCESS;
 

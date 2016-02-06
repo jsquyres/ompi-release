@@ -11,7 +11,7 @@
  *                         All rights reserved.
  * Copyright (c) 2006      Sandia National Laboratories. All rights
  *                         reserved.
- * Copyright (c) 2013-2015 Cisco Systems, Inc.  All rights reserved.
+ * Copyright (c) 2013-2016 Cisco Systems, Inc.  All rights reserved.
  * $COPYRIGHT$
  *
  * Additional copyrights may follow
@@ -125,6 +125,11 @@ typedef struct mca_btl_base_endpoint_t {
     struct opal_btl_usnic_proc_t *endpoint_proc;
     int endpoint_proc_index;    /* index in owning proc's endpoint array */
 
+    /* The endpoint is not fully setup when it is constructed; we
+       defer some (expensive) initialization until it is needed.  This
+       flag is set to true when all the deferred setup is complete. */
+    bool endpoint_fully_setup;
+
     /** True when proc has been deleted, but still have sends that need ACKs */
     bool endpoint_exiting;
 
@@ -198,5 +203,6 @@ void
 opal_btl_usnic_flush_endpoint(
     opal_btl_usnic_endpoint_t *endpoint);
 
+int opal_btl_usnic_endpoint_finish_setup(opal_btl_usnic_endpoint_t *endpoint);
 END_C_DECLS
 #endif

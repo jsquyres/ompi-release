@@ -69,14 +69,13 @@ static void finalize_one_channel(opal_btl_usnic_module_t *module,
 
 
 /*
- * Loop over a block of procs sent to us in add_procs and see if we
- * want to add a proc/endpoint for them.
+ * Loop over the procs sent to us in add_procs and see if we want to
+ * add a proc/endpoint for them.
  */
-static int add_procs_block_create_endpoints(opal_btl_usnic_module_t *module,
-                                            size_t block_offset,
-                                            size_t block_len,
-                                            opal_proc_t **procs,
-                                            mca_btl_base_endpoint_t **endpoints)
+static int add_procs_create_endpoints(opal_btl_usnic_module_t *module,
+                                      size_t nprocs,
+                                      opal_proc_t **procs,
+                                      mca_btl_base_endpoint_t **endpoints)
 {
     int rc;
     opal_proc_t* my_proc;
@@ -88,12 +87,11 @@ static int add_procs_block_create_endpoints(opal_btl_usnic_module_t *module,
         return OPAL_ERR_OUT_OF_RESOURCE;
     }
 
-    /* Loop over a block in the procs we were given */
-    for (size_t i = block_offset; i < (block_offset + block_len); i++) {
+    /* Loop over the procs we were given */
+    for (size_t i = 0; i < nprocs; i++) {
         struct opal_proc_t* opal_proc = procs[i];
         opal_btl_usnic_proc_t* usnic_proc;
         mca_btl_base_endpoint_t* usnic_endpoint;
-
         endpoints[i] = NULL;
 
         /* Do not create loopback usnic connections */
@@ -160,303 +158,6 @@ static int add_procs_block_create_endpoints(opal_btl_usnic_module_t *module,
 }
 
 /*
- * Print a warning about how the remote peer was unreachable.
- *
- * This is a separate helper function simply because it's somewhat
- * bulky to put inline.
- */
-static void add_procs_warn_unreachable(opal_btl_usnic_module_t *module,
-                                       opal_btl_usnic_endpoint_t *endpoint)
-{
-    /* Only show the warning if it is enabled */
-    if (!mca_btl_usnic_component.show_route_failures) {
-        return;
-    }
-
-    char remote[IPV4STRADDRLEN];
-    opal_btl_usnic_snprintf_ipv4_addr(remote, sizeof(remote),
-                                      endpoint->endpoint_remote_modex.ipv4_addr,
-                                      endpoint->endpoint_remote_modex.netmask);
-
-    opal_output_verbose(15, USNIC_OUT,
-                        "btl:usnic: %s (which is %s) couldn't reach peer %s",
-                        module->fabric_info->fabric_attr->name,
-                        module->if_ipv4_addr_str,
-                        remote);
-    opal_show_help("help-mpi-btl-usnic.txt", "unreachable peer IP",
-                   true,
-                   opal_process_info.nodename,
-                   module->if_ipv4_addr_str,
-                   module->fabric_info->fabric_attr->name,
-                   opal_get_proc_hostname(endpoint->endpoint_proc->proc_opal),
-                   remote);
-}
-
-/* A bunch of calls to fi_av_insert() were previously
- * invoked.  Go reap them all.
- */
-static int
-add_procs_block_reap_fi_av_inserts(opal_btl_usnic_module_t *module,
-                                   size_t block_offset,
-                                   size_t block_len,
-                                   struct mca_btl_base_endpoint_t **endpoints)
-{
-    int ret = OPAL_SUCCESS;
-    int num_left;
-    size_t i, channel;
-    uint32_t event;
-    struct fi_eq_entry entry;
-    struct fi_eq_err_entry err_entry;
-    bool error_occurred = false;
-
-    /* compute num fi_av_insert completions we are waiting for */
-    num_left = 0;
-    for (i = block_offset; i < (block_offset + block_len); ++i) {
-        if (NULL != endpoints[i]) {
-            num_left += USNIC_NUM_CHANNELS;
-        }
-    }
-
-    /* Loop polling for fi_av_insert completion (they were
-       individually started in btl_usnic_proc.c) */
-    while (num_left > 0) {
-        opal_btl_usnic_addr_context_t *context;
-
-        ret = fi_eq_sread(module->av_eq, &event, &entry, sizeof(entry), -1, 0);
-
-        /* fi_eq_sread() will return ret==sizeof(entry) if there are
-           no entries on the error queue and the event read completes
-           successfully.  We'll get a non-error event back for every
-           fi_av_insert(), even if that insert errors out. */
-        if (sizeof(entry) == ret) {
-            context = entry.context;
-            free(context);
-            --num_left;
-            ret = 0;
-        }
-
-        /* fi_eq_sread() will return -FI_EAVAIL if there's something
-           on the error queue.
-
-           Note that if an fi_av_insert() fails, it will *first*
-           return an entry on the error queue (i.e., have
-           fi_eq_sread() return -FI_EVAIL), and *second* it will
-           return an entry on the normal queue.  Meaning: the failed
-           fi_av_insert() context will show up twice.  So don't free
-           the context (or anything associated with it) here in this
-           error case, because the same context will show up in the
-           non-error case (above). */
-        else if (-FI_EAVAIL == ret) {
-            ret = fi_eq_readerr(module->av_eq, &err_entry, 0);
-            if (sizeof(err_entry) == ret) {
-                context = err_entry.context;
-
-                /* Got some kind of address failure.  This usually means
-                   that we couldn't find a route to that peer (e.g., the
-                   networking is hosed between us).  So just mark that we
-                   can't reach this peer, and print a pretty warning. */
-                if (EADDRNOTAVAIL == err_entry.err ||
-                     EHOSTUNREACH == err_entry.err) {
-
-                    /* Note that endpoint was passed in a context in
-                       USNIC_NUM_CHANNELS fi_av_insert() calls.
-                       Meaning: if that address fails to resolve,
-                       we'll get USNIC_NUM_CHANNELS error events back
-                       with a context containing that endpoint.
-
-                       We therefore only want to print a pretty
-                       warning about (and OBJ_RELEASE) that endpoint
-                       the *first* time it is reported. */
-                    for (i = block_offset; i < (block_offset + block_len); ++i) {
-                        if (endpoints[i] == context->endpoint) {
-                            add_procs_warn_unreachable(module,
-                                                       context->endpoint);
-                            OBJ_RELEASE(context->endpoint);
-                            endpoints[i] = NULL;
-                            break;
-                        }
-                    }
-                    ret = 0;
-                }
-
-                /* Got some other kind of error -- give up on this
-                   interface. */
-                else {
-                    opal_show_help("help-mpi-btl-usnic.txt",
-                                   "libfabric API failed",
-                                   true,
-                                   opal_process_info.nodename,
-                                   module->fabric_info->fabric_attr->name,
-                                   "async insertion result", __FILE__, __LINE__,
-                                   err_entry.err,
-                                   "Failed to insert address to AV");
-                    ret = OPAL_ERR_OUT_OF_RESOURCE;
-                    error_occurred = true;
-
-                    /* we can't break here, need to finish reaping all
-                       inserts */
-                }
-
-                /* Don't free the context or the endpoint -- events
-                   that come in as errors will *also* come in as real
-                   events */
-
-            } else {
-                /* If we get here, it means fi_eq_readerr() failed
-                   badly, which means something has gone tremendously
-                   wrong.  Probably the only safe thing to do here is
-                   exit. */
-                opal_show_help("help-mpi-btl-usnic.txt",
-                               "internal error during init",
-                               true,
-                               opal_process_info.nodename,
-                               module->fabric_info->fabric_attr->name,
-                               "fi_eq_readerr()", __FILE__, __LINE__,
-                               ret,
-                               "Returned != sizeof(err_entry)");
-                ret = OPAL_ERR_OUT_OF_RESOURCE;
-                error_occurred = true;
-
-                /* Per above, there's really nothing sane left to do
-                   but exit */
-                opal_btl_usnic_exit(module);
-            }
-        } else {
-            /* If we get here, it means fi_eq_readerr() failed badly,
-               which means something has gone tremendously wrong.
-               Given that we're potentially not even all the way
-               through MPI_INIT yet, the only sane thing to do here is
-               exit. */
-            opal_show_help("help-mpi-btl-usnic.txt",
-                           "internal error during init",
-                           true,
-                           opal_process_info.nodename,
-                           module->fabric_info->fabric_attr->name,
-                           "fi_eq_sread()", __FILE__, __LINE__,
-                           ret,
-                           "Returned != (sizeof(entry) or -FI_EAVAIL)");
-            ret = OPAL_ERR_OUT_OF_RESOURCE;
-            error_occurred = true;
-
-            /* Per above, there's really nothing sane left to do but
-               exit */
-            opal_btl_usnic_exit(module);
-        }
-    }
-
-    /* Look through the list:
-       - If something went wrong above, free all endpoints.
-       - If an otherwise-valid endpoint has no dest, that means we timed
-         out trying to resolve it, so just release that endpoint. */
-    size_t num_endpoints_created = 0;
-    for (i = block_offset; i < (block_offset + block_len); i++) {
-        if (NULL != endpoints[i]) {
-            bool happy;
-
-            happy = true;
-            if (error_occurred) {
-                happy = false;
-            } else {
-                for (channel = 0; channel < USNIC_NUM_CHANNELS; ++channel) {
-                    if (FI_ADDR_NOTAVAIL ==
-                            endpoints[i]->endpoint_remote_addrs[channel]) {
-                        happy = false;
-                        break;
-                    }
-                }
-            }
-
-            if (happy) {
-                ++num_endpoints_created;
-            } else {
-                OBJ_RELEASE(endpoints[i]);
-                endpoints[i] = NULL;
-            }
-        }
-    }
-
-    /* All done */
-    opal_output_verbose(5, USNIC_OUT,
-                        "btl:usnic: created destinations for %" PRIsize_t
-                        " endpoints",
-                        num_endpoints_created);
-    return ret;
-}
-
-/*
- * Create endpoints for the procs we were given in add_procs.
- */
-static int add_procs_create_endpoints(struct opal_btl_usnic_module_t* module,
-                                      size_t nprocs,
-                                      struct opal_proc_t **procs,
-                                      struct mca_btl_base_endpoint_t** endpoints)
-{
-    /* We need to ensure that we don't overrun the libfabric AV EQ.
-       Divide up all the peer address resolutions we need to do into a
-       series of blocks; insert and complete each block before moving
-       to the next (note: if performance mandates it, we can move to a
-       sliding window style of AV inserts to get better concurrency of
-       AV resolution). */
-
-    /* Leave a few empty slots in the AV EQ, just for good measure */
-    if (module->av_eq_size < 8) {
-        opal_show_help("help-mpi-btl-usnic.txt", "fi_av_eq too small",
-                       true,
-                       opal_process_info.nodename,
-                       module->av_eq_size,
-                       8);
-        return OPAL_ERR_OUT_OF_RESOURCE;
-    }
-
-    size_t eq_size = module->av_eq_size - 8;
-    size_t block_len = eq_size;
-    size_t num_av_inserts = nprocs * USNIC_NUM_CHANNELS;
-    size_t num_blocks = num_av_inserts / block_len;
-    if (num_av_inserts % block_len != 0) {
-        ++num_blocks;
-    }
-
-    /* Per above, the blocks are expressed in terms of number of AV
-       inserts.  Convert them to be expressed in terms of number of
-       procs. */
-    block_len /= USNIC_NUM_CHANNELS;
-
-    /* Per above, loop over creating the endpoints so that we do not
-       overrun the libfabric AV EQ. */
-    int rc;
-    for (size_t block_offset = 0, block = 0; block < num_blocks;
-         block_offset += block_len, ++block) {
-        /* Adjust for the last block */
-        if (block_len > (nprocs - block_offset)) {
-            block_len = nprocs - block_offset;
-        }
-
-        /* First, create endpoints (and procs, if they're not already
-           created) for the usnic-reachable procs we were given. */
-        rc = add_procs_block_create_endpoints(module,
-                                              block_offset, block_len,
-                                              procs, endpoints);
-        if (OPAL_SUCCESS != rc) {
-            return rc;
-        }
-
-        /* For each endpoint that was created, we initiated the
-           process to create NUM_CHANNELS fi_addrs.  Go finish all of
-           those.  This will be the final determination of whether we
-           can use the endpoint or not because we'll find out if each
-           endpoint is reachable or not. */
-        rc = add_procs_block_reap_fi_av_inserts(module,
-                                                block_offset, block_len,
-                                                endpoints);
-        if (OPAL_SUCCESS != rc) {
-            return rc;
-        }
-    }
-
-    return OPAL_SUCCESS;
-}
-
-/*
  * Add procs to this BTL module, receiving endpoint information from
  * the modex.  This is done in 2 phases:
  *
@@ -489,22 +190,12 @@ static int usnic_add_procs(struct mca_btl_base_module_t* base_module,
         goto fail;
     }
 
-    /* Find all the endpoints with a complete set of USD destinations
-       and mark them as reachable */
+    /* We rely on bipartite graph solving to figure out if peers are
+       reachable -- it's a hueristic, but it's (much) faster at scale
+       than trying to get a network route to each peer. */
     for (size_t i = 0; NULL != reachable && i < nprocs; ++i) {
         if (NULL != endpoints[i]) {
-            bool happy = true;
-            for (int channel = 0; channel < USNIC_NUM_CHANNELS; ++channel) {
-                if (FI_ADDR_NOTAVAIL ==
-                        endpoints[i]->endpoint_remote_addrs[channel]) {
-                    happy = false;
-                    break;
-                }
-            }
-
-            if (happy) {
-                opal_bitmap_set_bit(reachable, i);
-            }
+            opal_bitmap_set_bit(reachable, i);
         }
     }
 
@@ -874,9 +565,6 @@ static int usnic_finalize(struct mca_btl_base_module_t* btl)
     if (NULL != module->av) {
         fi_close(&module->av->fid);
     }
-    if (NULL != module->av_eq) {
-        fi_close(&module->av_eq->fid);
-    }
     if (NULL != module->dom_eq) {
         fi_close(&module->dom_eq->fid);
     }
@@ -1168,6 +856,16 @@ opal_btl_usnic_module_progress_sends(
         /* Is it time to send ACK? */
         if (endpoint->endpoint_acktime == 0 ||
             endpoint->endpoint_acktime <= get_nsec()) {
+
+            /* Make sure the endpoint is setup */
+            if (OPAL_UNLIKELY(!endpoint->endpoint_fully_setup)) {
+                int ret = opal_btl_usnic_endpoint_finish_setup(endpoint);
+                if (OPAL_SUCCESS != ret) {
+                    // JMS WTF to do if the deferred endpoint setup is borked?
+                    return ret;
+                }
+            }
+
             opal_btl_usnic_ack_send(module, endpoint);
             opal_btl_usnic_remove_from_endpoints_needing_ack(endpoint);
         }
@@ -1211,6 +909,13 @@ usnic_send(
     endpoint = (opal_btl_usnic_endpoint_t *)base_endpoint;
     module = (opal_btl_usnic_module_t *)base_module;
     frag = (opal_btl_usnic_send_frag_t*) descriptor;
+
+    if (OPAL_UNLIKELY(!endpoint->endpoint_fully_setup)) {
+        int ret = opal_btl_usnic_endpoint_finish_setup(endpoint);
+        if (OPAL_SUCCESS != ret) {
+            return ret;
+        }
+    }
 
     assert(frag->sf_endpoint == endpoint);
     frag->sf_base.uf_remote_seg[0].seg_addr.pval = NULL;      /* not a PUT */
@@ -2069,7 +1774,6 @@ static int init_channels(opal_btl_usnic_module_t *module)
 
     memset(&av_attr, 0, sizeof(av_attr));
     av_attr.type = FI_AV_MAP;
-    av_attr.flags = FI_EVENT;
     rc = fi_av_open(module->domain, &av_attr, &module->av, NULL);
     if (rc != OPAL_SUCCESS) {
         goto destroy;
@@ -2082,22 +1786,8 @@ static int init_channels(opal_btl_usnic_module_t *module)
     }
 
     memset(&eq_attr, 0, sizeof(eq_attr));
-    eq_attr.size = module->av_eq_num;
-    eq_attr.wait_obj = FI_WAIT_UNSPEC;
-    rc = fi_eq_open(module->fabric, &eq_attr, &module->av_eq, NULL);
-    if (rc != OPAL_SUCCESS) {
-        goto destroy;
-    }
-    // Save the size of the created EQ
-    module->av_eq_size = eq_attr.size;
-
     eq_attr.wait_obj = FI_WAIT_FD;
     rc = fi_eq_open(module->fabric, &eq_attr, &module->dom_eq, NULL);
-    if (rc != OPAL_SUCCESS) {
-        goto destroy;
-    }
-
-    rc = fi_av_bind(module->av, &module->av_eq->fid, 0);
     if (rc != OPAL_SUCCESS) {
         goto destroy;
     }

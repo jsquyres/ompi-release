@@ -13,7 +13,7 @@
  *                         reserved.
  * Copyright (c) 2007      The Regents of the University of California.
  *                         All rights reserved.
- * Copyright (c) 2013-2014 Cisco Systems, Inc.  All rights reserved.
+ * Copyright (c) 2013-2016 Cisco Systems, Inc.  All rights reserved.
  * Copyright (c) 2015      Intel, Inc. All rights reserved
  * $COPYRIGHT$
  *
@@ -32,6 +32,7 @@
 
 #include "opal/prefetch.h"
 #include "opal/types.h"
+#include "opal/util/show_help.h"
 
 #include "btl_usnic.h"
 #include "btl_usnic_endpoint.h"
@@ -79,18 +80,9 @@ static void endpoint_construct(mca_btl_base_endpoint_t* endpoint)
     memset(endpoint->endpoint_rcvd_segs, 0,
            sizeof(endpoint->endpoint_rcvd_segs));
 
-    /*
-     * Make a new OPAL hotel for this module
-     * "hotel" is a construct used for triggering segment retransmission
-     * due to timeout
-     */
-    OBJ_CONSTRUCT(&endpoint->endpoint_hotel, opal_hotel_t);
-    opal_hotel_init(&endpoint->endpoint_hotel,
-                    WINDOW_SIZE,
-                    opal_sync_event_base,
-                    mca_btl_usnic_component.retrans_timeout,
-                    0,
-                    opal_btl_usnic_ack_timeout);
+    /* Defer setting up the OPAL hotel for this endpoint (setting up
+       hotels are expensive -- set up a hotel upon first send/use). */
+    endpoint->endpoint_fully_setup = false;
 
     /* Setup this endpoint's list links */
     OBJ_CONSTRUCT(&(endpoint->endpoint_ack_li), opal_list_item_t);
@@ -106,6 +98,105 @@ static void endpoint_construct(mca_btl_base_endpoint_t* endpoint)
         opal_btl_usnic_exit(endpoint->endpoint_module);
         /* Does not return */
     }
+}
+
+/*
+ * Print a warning about how the remote peer was unreachable.
+ *
+ * This is a separate helper function simply because it's somewhat
+ * bulky to put inline.
+ */
+static void warn_unreachable(opal_btl_usnic_endpoint_t *endpoint)
+{
+    /* Only show the warning if it is enabled */
+    if (!mca_btl_usnic_component.show_route_failures) {
+        return;
+    }
+
+    opal_btl_usnic_module_t *module = endpoint->endpoint_module;
+
+    char remote[IPV4STRADDRLEN];
+    opal_btl_usnic_snprintf_ipv4_addr(remote, sizeof(remote),
+                                      endpoint->endpoint_remote_modex.ipv4_addr,
+                                      endpoint->endpoint_remote_modex.netmask);
+
+    opal_output_verbose(15, USNIC_OUT,
+                        "btl:usnic: %s (which is %s) couldn't reach peer %s",
+                        module->fabric_info->fabric_attr->name,
+                        module->if_ipv4_addr_str,
+                        remote);
+    opal_show_help("help-mpi-btl-usnic.txt", "unreachable peer IP",
+                   true,
+                   opal_process_info.nodename,
+                   module->if_ipv4_addr_str,
+                   module->fabric_info->fabric_attr->name,
+                   opal_get_proc_hostname(endpoint->endpoint_proc->proc_opal),
+                   remote);
+}
+
+/* Part two of the endpoint setup: do the expensive (slow) things. We
+ * defer this until we have to send to or receive from the given
+ * peer (vs. doing this for every endpoint during add_procs).
+ */
+int opal_btl_usnic_endpoint_finish_setup(opal_btl_usnic_endpoint_t *endpoint)
+{
+    /* Make a new OPAL hotel for this endpoint.  The "hotel" is a
+       construct used for triggering segment retransmission due to
+       timeout. */
+    OBJ_CONSTRUCT(&endpoint->endpoint_hotel, opal_hotel_t);
+    opal_hotel_init(&endpoint->endpoint_hotel,
+                    WINDOW_SIZE,
+                    opal_sync_event_base,
+                    mca_btl_usnic_component.retrans_timeout,
+                    0,
+                    opal_btl_usnic_ack_timeout);
+
+    /* Add a destination to the fi_av vector for each channel */
+    int ret;
+    opal_btl_usnic_module_t *module = endpoint->endpoint_module;
+    opal_btl_usnic_modex_t *modex = &endpoint->endpoint_remote_modex;
+
+    char str[IPV4STRADDRLEN];
+    opal_btl_usnic_snprintf_ipv4_addr(str, sizeof(str), modex->ipv4_addr,
+                                      modex->netmask);
+    opal_output_verbose(5, USNIC_OUT,
+                        "btl:usnic: av_insert to %s:%d and :%d",
+                        str,
+                        modex->ports[USNIC_PRIORITY_CHANNEL],
+                        modex->ports[USNIC_DATA_CHANNEL]);
+
+    /* build remote address */
+    struct sockaddr_in sin[USNIC_NUM_CHANNELS] = {{0}};
+    for (int i = 0; i < USNIC_NUM_CHANNELS; ++i) {
+        sin[i].sin_family = AF_INET;
+        sin[i].sin_port = htons(modex->ports[i]);
+        sin[i].sin_addr.s_addr = modex->ipv4_addr;
+    }
+    ret = fi_av_insert(module->av, &sin[0], USNIC_NUM_CHANNELS,
+            &endpoint->endpoint_remote_addrs[0], 0, NULL);
+    if (USNIC_NUM_CHANNELS != ret) {
+        // Warn if the error was simply that the peer was unreachable
+        for (int i = 0; i < USNIC_NUM_CHANNELS; ++i) {
+            if (FI_ADDR_NOTAVAIL == endpoint->endpoint_remote_addrs[i]) {
+                warn_unreachable(endpoint);
+                return OPAL_ERR_UNREACH;
+            }
+        }
+
+        // Some other kind of error
+        opal_show_help("help-mpi-btl-usnic.txt", "libfabric API failed",
+                       true,
+                       opal_process_info.nodename,
+                       module->fabric_info->fabric_attr->name,
+                       "fi_av_insert()", __FILE__, __LINE__,
+                       ret,
+                       "Failed to initiate AV insert");
+        return OPAL_ERROR;
+    }
+
+
+    endpoint->endpoint_fully_setup = true;
+    return OPAL_SUCCESS;
 }
 
 static void endpoint_destruct(mca_btl_base_endpoint_t* endpoint)
@@ -128,7 +219,8 @@ static void endpoint_destruct(mca_btl_base_endpoint_t* endpoint)
     opal_mutex_unlock(&module->all_endpoints_lock);
     OBJ_DESTRUCT(&(endpoint->endpoint_endpoint_li));
 
-    if (endpoint->endpoint_hotel.rooms != NULL) {
+    if (endpoint->endpoint_fully_setup &&
+        endpoint->endpoint_hotel.rooms != NULL) {
         OBJ_DESTRUCT(&(endpoint->endpoint_hotel));
     }
 

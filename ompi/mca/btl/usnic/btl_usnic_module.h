@@ -110,8 +110,6 @@ typedef struct opal_btl_usnic_module_t {
     struct fid_eq *av_eq;
     struct fid_av *av;
 
-    size_t av_eq_size;
-
     mca_btl_base_module_error_cb_fn_t pml_error_callback;
 
     /* Information about the events */
@@ -129,7 +127,6 @@ typedef struct opal_btl_usnic_module_t {
     int sd_num;
     int rd_num;
     int cq_num;
-    int av_eq_num;
     int prio_sd_num;
     int prio_rd_num;
 

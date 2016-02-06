@@ -11,7 +11,7 @@
  *                         All rights reserved.
  * Copyright (c) 2006      Sandia National Laboratories. All rights
  *                         reserved.
- * Copyright (c) 2013-2015 Cisco Systems, Inc.  All rights reserved.
+ * Copyright (c) 2013-2016 Cisco Systems, Inc.  All rights reserved.
  * Copyright (c) 2013-2014 Intel, Inc. All rights reserved
  * $COPYRIGHT$
  *
@@ -664,54 +664,6 @@ out_free_table:
 }
 
 /*
- * Initiate the process to create a USD dest.
- * It will be polled for completion later.
- */
-static int start_av_insert(opal_btl_usnic_module_t *module,
-                                  opal_btl_usnic_endpoint_t *endpoint,
-                                  int channel)
-{
-    int ret;
-    opal_btl_usnic_modex_t *modex = &endpoint->endpoint_remote_modex;
-    opal_btl_usnic_addr_context_t *context;
-    struct sockaddr_in sin;
-
-    context = calloc(1, sizeof(*context));
-    context->endpoint = endpoint;
-    context->channel_id = channel;
-
-    char str[IPV4STRADDRLEN];
-    opal_btl_usnic_snprintf_ipv4_addr(str, sizeof(str), modex->ipv4_addr,
-                                      modex->netmask);
-    opal_output_verbose(5, USNIC_OUT,
-                        "btl:usnic:start_av_insert: to channel %d at %s:%d",
-                        channel, str, modex->ports[channel]);
-
-    /* build remote address */
-    memset(&sin, 0, sizeof(sin));
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(modex->ports[channel]);
-    sin.sin_addr.s_addr = modex->ipv4_addr;
-
-    ret = fi_av_insert(module->av, &sin, 1,
-            &endpoint->endpoint_remote_addrs[channel], 0, context);
-    /* Did an error occur? */
-    if (0 != ret) {
-        opal_show_help("help-mpi-btl-usnic.txt", "libfabric API failed",
-                       true,
-                       opal_process_info.nodename,
-                       module->fabric_info->fabric_attr->name,
-                       "fi_av_insert()", __FILE__, __LINE__,
-                       ret,
-                       "Failed to initiate AV insert");
-        free(context);
-        return OPAL_ERROR;
-    }
-
-    return OPAL_SUCCESS;
-}
-
-/*
  * Create an endpoint and claim the matched modex slot
  */
 int
@@ -732,25 +684,21 @@ opal_btl_usnic_create_endpoint(opal_btl_usnic_module_t *module,
         return rc;
     }
 
+    //JMS
+    usnic_time_add(5,-1);
+
     endpoint = OBJ_NEW(opal_btl_usnic_endpoint_t);
     if (NULL == endpoint) {
         return OPAL_ERR_OUT_OF_RESOURCE;
     }
 
+    //JMS
+    usnic_time_add(6,5);
+
     /* Initalize the endpoint */
     endpoint->endpoint_module = module;
     assert(modex_index >= 0 && modex_index < (int)proc->proc_modex_count);
     endpoint->endpoint_remote_modex = proc->proc_modex[modex_index];
-
-    /* Start creating destinations; one for each channel.  These
-       progress in the background.a */
-    for (int i = 0; i < USNIC_NUM_CHANNELS; ++i)  {
-        rc = start_av_insert(module, endpoint, i);
-        if (OPAL_SUCCESS != rc) {
-            OBJ_RELEASE(endpoint);
-            return rc;
-        }
-    }
 
     /* Initialize endpoint sequence number info */
     endpoint->endpoint_next_seq_to_send = module->local_modex.isn;
